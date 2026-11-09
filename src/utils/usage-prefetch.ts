@@ -11,6 +11,11 @@ import {
 
 import { observeExtraUsageSpend } from './daily-spend';
 import { getLastResponseAtMs } from './session-usage-history';
+import {
+    readSharedRateLimits,
+    recordSharedRateLimits,
+    type SharedRateLimits
+} from './shared-rate-limits';
 import type { UsageData } from './usage';
 import {
     fetchUsageData,
@@ -202,8 +207,7 @@ function getPayloadUsageFields(rateLimitsData: UsageData | null, requirements: U
 // When the payload's percents were reported, if that's long enough ago that the
 // usage API may know more. Null when they're recent, or when the transcript has
 // no response to date them by (a new one after /clear): then they stand.
-function getIdlePayloadUsageTime(data: StatusJSON | undefined, nowMs: number): number | null {
-    const seenAtMs = getLastResponseAtMs(data?.transcript_path);
+function getIdlePayloadUsageTime(seenAtMs: number | undefined, nowMs: number): number | null {
     return seenAtMs !== undefined && nowMs - seenAtMs > PAYLOAD_USAGE_TRUSTED_MS ? seenAtMs : null;
 }
 
@@ -243,6 +247,56 @@ function refreshIdlePayloadUsage(usageData: UsageData, rateLimitsData: UsageData
             }
         }
     }
+}
+
+// While the usage API can't be reached (a 429's Retry-After, a timeout, its
+// backoff lock), the newest rate_limits any session in this config directory
+// reported stand in for it (see shared-rate-limits.ts). They fill windows
+// nothing else has, and, within the same window, replace a lower percent from
+// an idle payload or a stale API cache: usage never falls within a window, so
+// the higher one is the newer. This session's own recent payload stands, and a
+// different window that hasn't reset is another login's, so it stands too.
+// Only called when the API answer is an error or a stale fallback, so a
+// working API keeps the last word.
+function withSharedRateLimits(
+    usageData: UsageData | null,
+    shared: SharedRateLimits | null,
+    rateLimitsData: UsageData | null,
+    payloadSeenAtMs: number | null
+): UsageData | null {
+    // Stored with the payload's bucket names and fields (see shared-rate-limits.ts)
+    const sharedData = shared ? extractUsageDataFromRateLimits(shared) : null;
+    if (!sharedData) {
+        return usageData;
+    }
+
+    const result: UsageData = { ...usageData };
+    let changed = false;
+    for (const { usageField, resetField } of PAYLOAD_USAGE_WINDOWS) {
+        const sharedPercent = sharedData[usageField];
+        if (typeof sharedPercent !== 'number' || (rateLimitsData?.[usageField] !== undefined && payloadSeenAtMs === null)) {
+            continue;
+        }
+
+        const currentPercent = result[usageField];
+        if (typeof currentPercent === 'number') {
+            const isSameWindow = Math.abs(parseResetAtMs(result[resetField]) - parseResetAtMs(sharedData[resetField])) <= SAME_WINDOW_MS;
+            if (!isSameWindow || sharedPercent <= currentPercent) {
+                continue;
+            }
+        }
+
+        setUsageField(result, usageField, sharedPercent);
+        setUsageField(result, resetField, sharedData[resetField]);
+        // A shared window that doesn't know when it was seen leaves the forecast's history alone
+        const observedAtMs = shared?.five_hour?.observedAtMs ?? 0;
+        if (usageField === 'sessionUsage' && observedAtMs > 0) {
+            result.sessionUsageObservedAtMs = observedAtMs;
+        }
+        changed = true;
+    }
+
+    return changed ? result : usageData;
 }
 
 // A cached answer can outlive its block: the cache is reused for minutes, and
@@ -397,11 +451,20 @@ export async function prefetchUsageDataIfNeeded(lines: WidgetItem[][], data?: St
         return null;
     }
 
+    // Read the transcript for it at most once per render
+    let lastResponseAtMs: { value: number | undefined } | undefined;
+    const getPayloadSeenAtMs = (): number | undefined => {
+        lastResponseAtMs ??= { value: getLastResponseAtMs(data?.transcript_path) };
+        return lastResponseAtMs.value;
+    };
+
+    recordSharedRateLimits(data?.rate_limits, getPayloadSeenAtMs);
+
     const rateLimitsData = extractUsageDataFromRateLimits(data?.rate_limits);
     const requirements = getUsageFieldRequirements(lines);
     const nowMs = Date.now();
     const payloadUsageFields = getPayloadUsageFields(rateLimitsData, requirements);
-    const payloadSeenAtMs = payloadUsageFields.length > 0 ? getIdlePayloadUsageTime(data, nowMs) : null;
+    const payloadSeenAtMs = payloadUsageFields.length > 0 ? getIdlePayloadUsageTime(getPayloadSeenAtMs(), nowMs) : null;
     if (payloadSeenAtMs !== null) {
         requirements.push(...payloadUsageFields.map(field => ({ field, fromApi: true, suppressFetchError: true })));
     }
@@ -414,16 +477,19 @@ export async function prefetchUsageDataIfNeeded(lines: WidgetItem[][], data?: St
     }
 
     const apiData = await fetchUsageData({ requiredFields: missingFields });
+    const shared = apiData.error !== undefined || isStaleUsageFallback(apiData) ? readSharedRateLimits() : null;
     if (apiData.error && missingRequirements.suppressFetchError) {
-        return hasAnyUsageDataField(apiData)
+        const fallbackData = hasAnyUsageDataField(apiData)
             ? mergeUsageData(rateLimitsData, { ...apiData, error: undefined })
             : rateLimitsData;
+        return withSharedRateLimits(fallbackData, shared, rateLimitsData, payloadSeenAtMs);
     }
 
-    const usageData = mergeUsageData(rateLimitsData, apiData);
+    let usageData = mergeUsageData(rateLimitsData, apiData);
     if (payloadSeenAtMs !== null && rateLimitsData && !apiData.error) {
         refreshIdlePayloadUsage(usageData, rateLimitsData, apiData, payloadSeenAtMs, nowMs);
     }
+    usageData = withSharedRateLimits(usageData, shared, rateLimitsData, payloadSeenAtMs) ?? usageData;
 
     // A stale fallback is the last good cache, served while the API can't be reached
     // once it has outlived a refresh, so like a failed fetch it leaves the payload's percent to decide

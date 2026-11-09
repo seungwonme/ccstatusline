@@ -19,6 +19,7 @@ import { SessionUsageWidget } from '../../widgets/SessionUsage';
 import { WeeklyUsageWidget } from '../../widgets/WeeklyUsage';
 import * as dailySpend from '../daily-spend';
 import { getDefaultSessionUsageHistoryDeps } from '../session-usage-history';
+import * as sharedRateLimits from '../shared-rate-limits';
 import {
     extractUsageDataFromRateLimits,
     hasUsageDependentWidgets,
@@ -34,6 +35,26 @@ function epochToIso(epochSeconds: number): string {
     return new Date(epochSeconds * 1000).toISOString();
 }
 
+const realRecordSharedRateLimits = sharedRateLimits.recordSharedRateLimits;
+const realReadSharedRateLimits = sharedRateLimits.readSharedRateLimits;
+
+interface SharedRateLimitsMocks {
+    record: { mock: { calls: unknown[][] } };
+    read: {
+        mock: { calls: unknown[][] };
+        mockReturnValue: (value: sharedRateLimits.SharedRateLimits | null) => void;
+    };
+}
+
+// Keeps every render off the live shared rate-limits cache. Until a test sets
+// shared windows, no other session has reported any.
+function sandboxSharedRateLimits(): SharedRateLimitsMocks {
+    const record = vi.spyOn(sharedRateLimits, 'recordSharedRateLimits').mockImplementation(() => undefined);
+    const read = vi.spyOn(sharedRateLimits, 'readSharedRateLimits');
+    read.mockReturnValue(null);
+    return { record, read };
+}
+
 describe('usage prefetch', () => {
     let mockFetchUsageData: {
         mock: { calls: unknown[][] };
@@ -42,6 +63,7 @@ describe('usage prefetch', () => {
 
     beforeEach(() => {
         vi.restoreAllMocks();
+        sandboxSharedRateLimits();
         mockFetchUsageData = vi.spyOn(usage, 'fetchUsageData');
     });
 
@@ -974,6 +996,7 @@ describe('usage prefetch in a session left idle', () => {
         mockResolvedValue: (value: UsageData) => void;
     };
     let mockFetchedAt: { mockReturnValue: (value: number | undefined) => void };
+    let sharedMocks: SharedRateLimitsMocks;
 
     function payloadAfterResponse(lastResponseAtMs: number | null, rateLimits: StatusJSON['rate_limits'] = {
         five_hour: { used_percentage: 20, resets_at: BLOCK_RESET },
@@ -993,6 +1016,7 @@ describe('usage prefetch in a session left idle', () => {
     beforeEach(() => {
         vi.restoreAllMocks();
         vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+        sharedMocks = sandboxSharedRateLimits();
         dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccstatusline-idle-usage-'));
         mockFetchUsageData = vi.spyOn(usage, 'fetchUsageData');
         mockFetchedAt = vi.spyOn(usage, 'getUsageFetchedAtMs');
@@ -1109,6 +1133,145 @@ describe('usage prefetch in a session left idle', () => {
             weeklyResetAt: epochToIso(WEEK_RESET)
         });
     });
+
+    describe('with rate_limits other sessions reported', () => {
+        function shared(fiveHour: number, sevenDay: number | null, observedAtMs = NOW - 5 * MINUTE, fiveHourReset = BLOCK_RESET): sharedRateLimits.SharedRateLimits {
+            return {
+                five_hour: { used_percentage: fiveHour, resets_at: fiveHourReset, observedAtMs },
+                ...(sevenDay === null ? {} : { seven_day: { used_percentage: sevenDay, resets_at: WEEK_RESET, observedAtMs } })
+            };
+        }
+
+        it('keeps this payload\'s rate_limits for other sessions, dated by its last response', async () => {
+            const payload = payloadAfterResponse(NOW - 2 * MINUTE);
+
+            await prefetchUsageDataIfNeeded(lines, payload);
+
+            expect(sharedMocks.record.mock.calls).toHaveLength(1);
+            const [rateLimits, observedAtMs] = sharedMocks.record.mock.calls[0] as [StatusJSON['rate_limits'], () => number | undefined];
+            expect(rateLimits).toEqual(payload.rate_limits);
+            expect(observedAtMs()).toBe(NOW - 2 * MINUTE);
+        });
+
+        it('shows them instead of an error when the API is rate limited and nothing is cached', async () => {
+            mockFetchUsageData.mockResolvedValue({ error: 'rate-limited' });
+            mockFetchedAt.mockReturnValue(undefined);
+            sharedMocks.read.mockReturnValue(shared(45, 60));
+
+            // A session before its first response has no rate_limits of its own
+            const usageData = await prefetchUsageDataIfNeeded(lines, { transcript_path: path.join(dir, 'missing.jsonl') });
+
+            expect(usageData).toEqual({
+                sessionUsage: 45,
+                sessionResetAt: epochToIso(BLOCK_RESET),
+                sessionUsageObservedAtMs: NOW - 5 * MINUTE,
+                weeklyUsage: 60,
+                weeklyResetAt: epochToIso(WEEK_RESET),
+                error: 'rate-limited'
+            });
+        });
+
+        it('fills a reset timer from them when its startup fetch fails', async () => {
+            mockFetchUsageData.mockResolvedValue({ error: 'timeout' });
+            sharedMocks.read.mockReturnValue(shared(45, null));
+
+            const usageData = await prefetchUsageDataIfNeeded(makeLines([{ id: '1', type: 'reset-timer' }]), {});
+
+            expect(usageData).toMatchObject({ sessionUsage: 45, sessionResetAt: epochToIso(BLOCK_RESET) });
+            expect(usageData?.error).toBeUndefined();
+        });
+
+        it('leaves them unread while the API answers', async () => {
+            mockFetchUsageData.mockResolvedValue({ sessionUsage: 30, sessionResetAt: epochToIso(BLOCK_RESET), weeklyUsage: 55, weeklyResetAt: epochToIso(WEEK_RESET) });
+            mockFetchedAt.mockReturnValue(NOW - MINUTE);
+            sharedMocks.read.mockReturnValue(shared(45, 60));
+
+            const usageData = await prefetchUsageDataIfNeeded(lines, {});
+
+            expect(usageData).toMatchObject({ sessionUsage: 30, weeklyUsage: 55 });
+            expect(sharedMocks.read.mock.calls).toEqual([]);
+        });
+
+        it('raises a stale API cache\'s lower percent in the same window, and keeps a higher one', async () => {
+            const staleData: UsageData = { sessionUsage: 30, sessionResetAt: epochToIso(BLOCK_RESET), weeklyUsage: 70, weeklyResetAt: epochToIso(WEEK_RESET) };
+            mockFetchUsageData.mockResolvedValue(staleData);
+            mockFetchedAt.mockReturnValue(NOW - 60 * MINUTE);
+            vi.spyOn(usage, 'isStaleUsageFallback').mockImplementation(data => data === staleData);
+            sharedMocks.read.mockReturnValue(shared(45, 60));
+
+            const usageData = await prefetchUsageDataIfNeeded(lines, {});
+
+            expect(usageData).toMatchObject({ sessionUsage: 45, weeklyUsage: 70 });
+        });
+
+        it('raises an idle payload\'s percent when the API can\'t answer', async () => {
+            mockFetchUsageData.mockResolvedValue({ error: 'rate-limited' });
+            mockFetchedAt.mockReturnValue(undefined);
+            sharedMocks.read.mockReturnValue(shared(35, 50, NOW - 4 * MINUTE));
+            const payload = payloadAfterResponse(NOW - 20 * MINUTE);
+
+            const usageData = await prefetchUsageDataIfNeeded(lines, payload);
+
+            expect(usageData).toEqual({
+                sessionUsage: 35,
+                sessionResetAt: epochToIso(BLOCK_RESET),
+                sessionUsageObservedAtMs: NOW - 4 * MINUTE,
+                weeklyUsage: 50,
+                weeklyResetAt: epochToIso(WEEK_RESET)
+            });
+            expect(getDefaultSessionUsageHistoryDeps(payload, usageData).percentSeenAt?.()).toBe(NOW - 4 * MINUTE);
+        });
+
+        it.each([
+            ['a lower percent', shared(10, null)],
+            ['another window that the payload\'s hasn\'t reached', shared(35, null, NOW - MINUTE, BLOCK_RESET + 60 * 60)]
+        ])('keeps an idle payload\'s percent over %s', async (_label, sharedWindows) => {
+            mockFetchUsageData.mockResolvedValue({ error: 'rate-limited' });
+            sharedMocks.read.mockReturnValue(sharedWindows);
+
+            const usageData = await prefetchUsageDataIfNeeded(makeLines([{ id: '1', type: 'session-usage' }]), payloadAfterResponse(NOW - 20 * MINUTE));
+
+            expect(usageData).toEqual({ sessionUsage: 20, sessionResetAt: epochToIso(BLOCK_RESET), weeklyUsage: 50, weeklyResetAt: epochToIso(WEEK_RESET) });
+        });
+
+        it('keeps a recent payload\'s own percent when a fetch for another widget fails', async () => {
+            mockFetchUsageData.mockResolvedValue({ error: 'rate-limited' });
+            sharedMocks.read.mockReturnValue(shared(35, 60));
+
+            const usageData = await prefetchUsageDataIfNeeded(
+                makeLines([{ id: '1', type: 'session-usage' }, { id: '2', type: 'extra-usage-used' }]),
+                payloadAfterResponse(NOW - MINUTE, { five_hour: { used_percentage: 20, resets_at: BLOCK_RESET } })
+            );
+
+            expect(usageData).toMatchObject({ sessionUsage: 20, error: 'rate-limited' });
+            expect(usageData?.weeklyUsage).toBe(60);
+        });
+
+        it('carries one session\'s rate_limits to another through the cache file', async () => {
+            const sharedDeps = {
+                ...sharedRateLimits.getDefaultSharedRateLimitsDeps(),
+                cachePath: path.join(dir, 'usage-test.rate-limits.json')
+            };
+            vi.spyOn(sharedRateLimits, 'recordSharedRateLimits').mockImplementation((rateLimits, observedAtMs) => {
+                realRecordSharedRateLimits(rateLimits, observedAtMs, sharedDeps);
+            });
+            vi.spyOn(sharedRateLimits, 'readSharedRateLimits').mockImplementation(() => realReadSharedRateLimits(sharedDeps));
+            mockFetchUsageData.mockResolvedValue({ error: 'rate-limited' });
+            mockFetchedAt.mockReturnValue(undefined);
+
+            // An active session, which the API isn't asked for
+            await prefetchUsageDataIfNeeded(lines, payloadAfterResponse(NOW - MINUTE, {
+                five_hour: { used_percentage: 42, resets_at: BLOCK_RESET },
+                seven_day: { used_percentage: 61, resets_at: WEEK_RESET }
+            }));
+            expect(mockFetchUsageData.mock.calls).toEqual([]);
+
+            // A new session while the API is rate limited
+            const usageData = await prefetchUsageDataIfNeeded(lines, {});
+
+            expect(usageData).toMatchObject({ sessionUsage: 42, weeklyUsage: 61, sessionUsageObservedAtMs: NOW - MINUTE });
+        });
+    });
 });
 
 describe('today\'s extra usage spend', () => {
@@ -1129,6 +1292,7 @@ describe('today\'s extra usage spend', () => {
 
     beforeEach(() => {
         vi.restoreAllMocks();
+        sandboxSharedRateLimits();
         mockFetchUsageData = vi.spyOn(usage, 'fetchUsageData');
         mockFetchUsageData.mockResolvedValue({ extraUsageEnabled: true, extraUsageUsed: 12345 });
         mockObserveSpend = vi.spyOn(dailySpend, 'observeExtraUsageSpend');

@@ -34,7 +34,7 @@ const CACHE_DIR = path.join(os.homedir(), '.cache', 'ccstatusline');
 // Use the effective directory for file identity, independently of the raw
 // environment value Claude Code uses to name Keychain services. Shared legacy
 // files are left untouched: their cache/lock cannot be assigned to a profile.
-function getUsageFilePath(suffix: 'json' | 'lock' | 'credentials.lock'): string {
+export function getUsageFilePath(suffix: 'json' | 'lock' | 'credentials.lock' | 'rate-limits.json'): string {
     const configDir = path.resolve(getClaudeConfigDir());
     const configHash = createHash('sha256').update(configDir).digest('hex').slice(0, 16);
     return path.join(CACHE_DIR, `usage-${configHash}.${suffix}`);
